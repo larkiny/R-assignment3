@@ -1,0 +1,205 @@
+---
+title: "Assignment 3"
+author: "M. Nethercott"
+date: "3/4/2017"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import Libraries
+
+```{r libraries, results="hide"}
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(topicmodels)
+```
+
+## Import all document files and the list of weeks file
+
+Calling setlocale() seems to cause issues with importing the data files (quotation marks get replaced with <U+201C>, for example). Removing this function call fixes the issue (**Ask about this**):
+`Sys.setlocale("LC_ALL", "C")`
+
+#####Create a list of all the files
+```{r}
+file.list <- list.files(path="./data", pattern=".csv",full.names = TRUE)
+```
+
+#####Loop over file list importing them and binding them together
+```{r}
+D1 <- do.call(rbind, lapply(file.list, read.csv, header = TRUE, stringsAsFactors = FALSE, na.strings=c("")))
+```
+
+#####Import the week-list data
+```{r}
+D2 <- read.csv("./data/Week-List/week-list.csv", header = TRUE)
+```
+
+## Strip HTML Tags
+#####Strip out HTML tags, comments, and the &nbsp; whitespace command
+```{r}
+D1$Notes <- gsub("</?\\w+((\\s+\\w+(\\s*=\\s*(?:\".*?\"|'.*?'|[\\^'\">\\s]+))?)+\\s*|\\s*)/?>|<!--[\\s\\S]*?-->", "", D1$Notes)
+D1$Notes <- gsub("&nbsp;", " ", D1$Notes)
+```
+
+#####Filter out rows with missing values in either the Title or Notes column (if no notes we don't include it in the analysis anyway, and no title means we can't match it with the week-list data frame)
+```{r}
+D1 <- filter(D1, !is.na(Notes) & !is.na(Title))
+```
+
+##Merge with week list
+```{r}
+D3 <- merge(D1, D2, by.x = "Title", by.y = "Title", all.x = TRUE)
+```
+
+#####Filter rows where week is NA, since we are only doing the analysis across each week
+```{r}
+D3 <- filter(D3, !is.na(week))
+```
+
+##Process text
+#####Convert the data frame to the corpus format that the tm package uses
+```{r}
+corpus <- Corpus(VectorSource(D3$Notes))
+```
+#####Remove spaces
+```{r}
+corpus <- tm_map(corpus, stripWhitespace)
+```
+#####Convert to lower case
+```{r}
+corpus <- tm_map(corpus, content_transformer(tolower))
+``` 
+#####Remove pre-defined stop words ('the', 'a', etc)
+```{r}
+corpus <- tm_map(corpus, removeWords, stopwords('english'))
+```
+#####Convert words to stems ("education" = "edu") for analysis, for more info see  http://tartarus.org/~martin/PorterStemmer/
+```{r}
+corpus <- tm_map(corpus, stemDocument, lazy=TRUE)
+```
+#####Remove numbers
+```{r}
+corpus <- tm_map(corpus, removeNumbers, lazy=TRUE)
+```
+#####remove punctuation
+```{r}
+corpus <- tm_map(corpus, removePunctuation, lazy=TRUE)
+```
+
+##Create a term matrix
+#####Convert corpus to a term document matrix - so each word can be analyzed individuallly
+```{r}
+tdm.corpus <- TermDocumentMatrix(corpus)
+```
+
+##Sentiment analysis
+#####Upload positive and negative word lexicons
+```{r}
+positive <- readLines("./data/positive-words.txt")
+negative <- readLines("./data/negative-words.txt")
+```
+
+#####Search for matches between each word and the two lexicons
+```{r}
+D3$positive <- tm_term_score(tdm.corpus, positive)
+D3$negative <- tm_term_score(tdm.corpus, negative)
+```
+
+#####Generate an overall pos-neg score for each line
+```{r}
+D3$score <- D3$positive - D3$negative
+```
+
+#####SENTIMENT SCORE PLOT
+```{r}
+#Group the data by week, then summarize the grouped data and create the computed column for the sentiment score sum
+grouped <- group_by(D3, week)
+summ <- summarise(grouped, sum_score = sum(score))
+
+# Add 'pos' column to indicate positive or negative sentiment score (this is just for aesthetic purposes, to set different colors for positive and negative sentiment scores)
+summ$pos <- ifelse(summ$sum_score >= 0, "positive", "negative")
+
+brk <- distinct(D3, week) #Get the breaks for the sentiment plot by weeks
+brk <- brk[!is.na(brk)] #Remove the NA value as we don't need this in the plot
+ggplot(summ, aes(x = week, y = sum_score, fill = pos)) + 
+  xlab("Weeks") + 
+  ylab("Sentiment Score") + 
+  scale_x_continuous(
+      label=function(x){return(paste("Week", x))}, 
+      breaks = as.numeric(unlist(brk))) + 
+  geom_bar(stat="identity",position="identity") + 
+  scale_fill_manual(values = c("positive" = "darkblue", "negative" = "red")) +
+  theme(axis.text.x = element_text(angle = 90), legend.position="none") +
+  geom_label(aes(label = sum_score), size = 3, fill = "white")
+```
+
+##LDA topic modeling
+#####Term Frequency Inverse Document Frequency
+```{r}
+dtm.tfi <- DocumentTermMatrix(corpus, control = list(weighting = weightTf))
+```
+
+#####Remove very uncommon terms (term freq inverse document freq < 0.1)
+```{r}
+dtm.tfi <- dtm.tfi[,dtm.tfi$v >= 0.1]
+```
+
+#####Remove non-zero entries
+```{r}
+rowTotals <- apply(dtm.tfi , 1, sum) #Find the sum of words in each Document
+dtm.tfi   <- dtm.tfi[rowTotals> 0, ] #Divide by sum across rows
+lda.model = LDA(dtm.tfi, k = 3)
+```
+
+#####Which terms are most common in each topic
+```{r}
+terms <- terms(lda.model)
+```
+
+#####Which documents belong to which topic
+```{r, results="hide"}
+topics <- topics(lda.model)
+```
+
+#####Assign each assigned topic to every observation in D3 dataset
+```{r}
+grouped$topic <- topics
+
+#Recode topic values to match the actual terms created as a result of the LDA modeling
+grouped$topic[grouped$topic==1] <- terms[1]
+grouped$topic[grouped$topic==2] <- terms[2]
+grouped$topic[grouped$topic==3] <- terms[3]
+```
+
+#####Combined visualization
+```{r}
+
+#Determine important topic for each week, first creating a crosstab of weeks and topics, with frequency for each topic grouped by week
+topicSumm <- as.data.frame(table(grouped$topic, grouped$week))
+topicSumm <- rename(topicSumm, topic = Var1, week = Var2, freq = Freq)
+topicGrp <- group_by(topicSumm, week)
+
+#Sort by frequency (descending) of topic within each week, then slice the top row from each
+topicGrp <- arrange(topicGrp, week, desc(freq))
+topicPerWeek <- slice(topicGrp, 1)
+
+summ <- merge(summ, topicPerWeek, by.x = "week", by.y = "week", all = TRUE)
+ggplot(summ, aes(x = week, y = sum_score, fill = pos)) + 
+  xlab("Weeks") + 
+  ylab("Sentiment Score") + 
+  scale_x_continuous(
+      label=function(x){return(paste("Week", x))}, 
+      breaks = as.numeric(unlist(brk))) + 
+  scale_y_continuous(limits = c(-20,110)) +
+  geom_bar(stat="identity",position="identity") + 
+  scale_fill_manual(name = "Sentiment", values = c("positive" = "darkblue", "negative" = "red")) +
+  theme(axis.text.x = element_text(angle = 90), legend.position="right") +
+  geom_label(aes(label=paste(topic, " (", sum_score, ")")), parse = TRUE, size = 2.5, fill = "white", vjust=1)
+```
